@@ -5,6 +5,7 @@ import re
 import torch
 from torch import nn
 
+from prime_rl.trainer.models.deepseek_v4.attention import DeepseekV4GroupedLinear
 from prime_rl.trainer.models.kernels.fp8_utils import (
     per_block_cast_to_fp8_tp_triton,
     per_block_cast_to_fp8_triton,
@@ -16,12 +17,14 @@ from prime_rl.utils.logger import get_logger
 
 
 @torch.library.custom_op("prime_rl::fp8_blockwise_mm", mutates_args=())
-def _fp8_blockwise_mm(x: torch.Tensor, weight: torch.Tensor, block_size: int) -> torch.Tensor:
+def _fp8_blockwise_mm(
+    x: torch.Tensor, weight: torch.Tensor, block_size: int, pow2_x_scales: bool = False
+) -> torch.Tensor:
     import deep_gemm
 
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     use_ue8m0 = ue8m0_for_device(x.device)
-    x_fp8 = per_token_cast_to_fp8_triton(x_2d, use_ue8m0, block_size)
+    x_fp8 = per_token_cast_to_fp8_triton(x_2d, use_ue8m0 or pow2_x_scales, block_size)
     weight_fp8 = per_block_cast_to_fp8_triton(weight, use_ue8m0, block_size)
 
     out = torch.empty((x_2d.size(0), weight.size(0)), device=x.device, dtype=torch.bfloat16)
@@ -30,7 +33,9 @@ def _fp8_blockwise_mm(x: torch.Tensor, weight: torch.Tensor, block_size: int) ->
 
 
 @_fp8_blockwise_mm.register_fake
-def _fp8_blockwise_mm_fake(x: torch.Tensor, weight: torch.Tensor, block_size: int) -> torch.Tensor:
+def _fp8_blockwise_mm_fake(
+    x: torch.Tensor, weight: torch.Tensor, block_size: int, pow2_x_scales: bool = False
+) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[0]), dtype=torch.bfloat16)
 
 
@@ -94,14 +99,14 @@ def _fp8_blockwise_mm_backward_fake(
 
 
 def _fp8_blockwise_mm_setup_context(ctx, inputs, output) -> None:
-    x, weight, block_size = inputs
+    x, weight, block_size, _ = inputs
     ctx.save_for_backward(x, weight)
     ctx.block_size = block_size
 
 
 def _fp8_blockwise_mm_autograd_backward(ctx, grad_output: torch.Tensor):
     x, weight = ctx.saved_tensors
-    needs_grad_x, needs_grad_weight, _ = ctx.needs_input_grad
+    needs_grad_x, needs_grad_weight, *_ = ctx.needs_input_grad
     grad_x, grad_weight = _fp8_blockwise_mm_backward(
         grad_output,
         x.detach(),
@@ -110,7 +115,7 @@ def _fp8_blockwise_mm_autograd_backward(ctx, grad_output: torch.Tensor):
         needs_grad_x,
         needs_grad_weight,
     )
-    return grad_x if needs_grad_x else None, grad_weight if needs_grad_weight else None, None
+    return grad_x if needs_grad_x else None, grad_weight if needs_grad_weight else None, None, None
 
 
 _fp8_blockwise_mm.register_autograd(
@@ -150,6 +155,35 @@ class Float8BlockwiseLinear(nn.Linear):
         return new_mod
 
 
+class Float8BlockwiseGroupedLinear(DeepseekV4GroupedLinear):
+    """DeepseekV4GroupedLinear with each group's matmul in FP8 blockwise via DeepGEMM.
+
+    Each group's weight rows are a multiple of the block size, so quantizing the whole weight in
+    128x128 blocks quantizes every group's slice exactly as vLLM's grouped FP8 einsum does. vLLM
+    rounds this projection's activation scales up to a power of two on every GPU, so the forward
+    does too.
+    """
+
+    def __init__(self, *args, block_size: int = 128, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.block_size = block_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weights = self.weight.chunk(self.n_groups)
+        return torch.stack(
+            [_fp8_blockwise_mm(x[..., g, :], weights[g], self.block_size, True) for g in range(self.n_groups)],
+            dim=-2,
+        )
+
+    @classmethod
+    def from_grouped_linear(cls, mod: DeepseekV4GroupedLinear) -> "Float8BlockwiseGroupedLinear":
+        with torch.device("meta"):
+            new_mod = cls(mod.in_features, mod.out_features, mod.n_groups, bias=mod.bias is not None)
+        new_mod.weight = mod.weight
+        new_mod.bias = mod.bias
+        return new_mod
+
+
 def replace_linear_with_fp8_blockwise_linear(model: nn.Module, ignore_modules: list[str]) -> None:
     """Replace nn.Linear in `model` with Float8BlockwiseLinear, skipping any
     module whose qualified name matches an ignore pattern (substring or regex).
@@ -182,12 +216,21 @@ def replace_linear_with_fp8_blockwise_linear(model: nn.Module, ignore_modules: l
         if any(re.search(pattern, name) for pattern in ignore_modules):
             skipped_modules.append(name)
             continue
-        if module.in_features % 128 != 0 or module.out_features % 128 != 0:
+        out_features = (
+            module.out_features // module.n_groups
+            if isinstance(module, DeepseekV4GroupedLinear)
+            else module.out_features
+        )
+        if module.in_features % 128 != 0 or out_features % 128 != 0:
             skipped_unaligned.append(f"{name}({module.in_features}->{module.out_features})")
             continue
         parent_name, attr_name = name.rsplit(".", 1) if "." in name else ("", name)
         parent = model.get_submodule(parent_name) if parent_name else model
-        setattr(parent, attr_name, Float8BlockwiseLinear.from_linear(module))
+        if isinstance(module, DeepseekV4GroupedLinear):
+            fp8_module = Float8BlockwiseGroupedLinear.from_grouped_linear(module)
+        else:
+            fp8_module = Float8BlockwiseLinear.from_linear(module)
+        setattr(parent, attr_name, fp8_module)
         replaced_modules.append(name)
 
     logger.info(
