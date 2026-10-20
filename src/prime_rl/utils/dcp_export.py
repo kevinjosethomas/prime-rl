@@ -279,7 +279,9 @@ def write_cpu_hf_groups(
     if not weight_map:
         raise ValueError("No HF tensors to write")
     for number in range(len(grouped)):
-        shutil.rmtree(output_dir / f".group-{number:05d}")
+        group_dir = output_dir / f".group-{number:05d}"
+        if group_dir.exists():
+            shutil.rmtree(group_dir)
     if len(shards) > 1:
         index = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
         path = output_dir / "model.safetensors.index.json"
